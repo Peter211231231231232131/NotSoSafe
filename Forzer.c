@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <urlmon.h>
 #include <wincrypt.h>
+#include <winhttp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,12 +13,13 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "winhttp.lib")
 
 #define FORZER_UPDATE_URL \
     "https://raw.githubusercontent.com/Peter211231231231232131/ForzerC2/master/Forzer.exe"
 
 /* Control-plane endpoint. Override with FORZER_SERVER=ws://host:port. */
-#define DEFAULT_SERVER "ws://127.0.0.1:3000"
+#define DEFAULT_SERVER "wss://forzerc2.onrender.com"
 
 /* ------------------------------------------------------------------ */
 /* Self-update                                                        */
@@ -81,6 +83,12 @@ static int do_update(void) {
    FORZER_ALLOW_REMOTE=0 (no flag needed). */
 static int g_allow_remote = 1;
 static SOCKET g_sock = INVALID_SOCKET;
+
+/* wss (TLS) transport handles (WinHTTP) */
+static HINTERNET g_ws = NULL, g_ws_req = NULL, g_ws_conn = NULL, g_ws_sess = NULL;
+
+static int tr_send(const char *data, int len);
+static int tr_recv(char *out, int cap);
 
 static void base64(const BYTE *in, int n, char *out) {
     static const char t[] =
@@ -214,6 +222,70 @@ static int ws_recv(SOCKET s, char *out, int cap) {
     if (opcode == 0xA) return ws_recv(s, out, cap);
     if (opcode != 0x1) return ws_recv(s, out, cap);
     return (int)len;
+}
+
+/* ------------------------------------------------------------------ */
+/* wss (TLS) transport via WinHTTP                                    */
+/* ------------------------------------------------------------------ */
+
+static int wss_handshake(const char *host, int port, const char *path) {
+    wchar_t whost[256], wpath[512];
+    if (!MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 256)) return 1;
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 512)) return 1;
+
+    g_ws_sess = WinHttpOpen(L"Forzer/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!g_ws_sess) return 1;
+    g_ws_conn = WinHttpConnect(g_ws_sess, whost, (INTERNET_PORT)port, 0);
+    if (!g_ws_conn) { WinHttpCloseHandle(g_ws_sess); g_ws_sess = NULL; return 1; }
+    g_ws_req = WinHttpOpenRequest(g_ws_conn, L"GET", wpath, NULL,
+                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                  WINHTTP_FLAG_SECURE);
+    if (!g_ws_req) return 1;
+
+    BYTE keyb[16];
+    rng_bytes(keyb, 16);
+    char keyb64[32];
+    base64(keyb, 16, keyb64);
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr),
+             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+             "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\n", keyb64);
+    wchar_t whdr[512];
+    if (!MultiByteToWideChar(CP_UTF8, 0, hdr, -1, whdr, 512)) return 1;
+    if (!WinHttpAddRequestHeaders(g_ws_req, whdr, -1, WINHTTP_ADDREQ_FLAG_ADD))
+        return 1;
+    if (!WinHttpSendRequest(g_ws_req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            NULL, 0, 0, 0)) return 1;
+    if (!WinHttpReceiveResponse(g_ws_req, NULL)) return 1;
+
+    g_ws = WinHttpWebSocketCompleteUpgrade(g_ws_req, 0);
+    if (!g_ws) return 1;
+    WinHttpCloseHandle(g_ws_req);
+    g_ws_req = NULL;
+    return 0;
+}
+
+static int tr_send(const char *data, int len) {
+    if (g_ws) {
+        DWORD r = WinHttpWebSocketSend(g_ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                                       (PVOID)data, (DWORD)len);
+        return (r == ERROR_SUCCESS) ? len : -1;
+    }
+    return ws_send_frame(g_sock, 0x1, data, len) ? len : -1;
+}
+
+static int tr_recv(char *out, int cap) {
+    if (g_ws) {
+        DWORD bytesRead = 0, closeStatus = 0;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
+        DWORD r = WinHttpWebSocketReceive(g_ws, out, (DWORD)cap, &bytesRead, &type);
+        if (r != ERROR_SUCCESS) return -1;
+        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) return -1;
+        out[bytesRead] = 0;
+        return (int)bytesRead;
+    }
+    return ws_recv(g_sock, out, cap);
 }
 
 static const char *json_str(const char *s, const char *key, char *out, int outsz) {
@@ -368,8 +440,7 @@ static DWORD WINAPI reader_thread(LPVOID lp) {
             snprintf(msg, sizeof(msg),
                      "{\"type\":\"command\",\"to\":\"%s\",\"id\":\"%s\",\"data\":\"%s\"}",
                      peer, id, esc);
-            if (g_sock != INVALID_SOCKET)
-                ws_send_frame(g_sock, 0x1, msg, (int)strlen(msg));
+             tr_send(msg, (int)strlen(msg));
             printf("sent command to %s (id=%s)\n", peer, id);
         } else if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
             break;
@@ -388,21 +459,17 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
     if (g_allow_remote)
         printf("WARNING: remote command execution is ENABLED on this host.\n");
 
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        fprintf(stderr, "error: WSAStartup failed\n");
+    int is_wss = (strncmp(url, "wss://", 6) == 0);
+    if (!is_wss && strncmp(url, "ws://", 5) != 0) {
+        fprintf(stderr, "error: only ws:// and wss:// supported\n");
         return 1;
     }
+    const char *auth = url + (is_wss ? 6 : 5);
 
-    if (strncmp(url, "ws://", 5) != 0) {
-        fprintf(stderr, "error: only ws:// supported (use wss via a tunnel if needed)\n");
-        return 1;
-    }
-    const char *auth = url + 5;
     char host[256] = {0}, path[512] = {0};
     const char *slash = strchr(auth, '/');
     const char *colon = strchr(auth, ':');
-    int port = 80;
+    int port = is_wss ? 443 : 80;
     if (colon && (!slash || colon < slash)) {
         int hl = (int)(colon - auth);
         if (hl >= sizeof(host)) hl = sizeof(host) - 1;
@@ -429,78 +496,91 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
     }
     if (path[0] == 0) path[0] = '/';
 
-    printf("connecting to %s:%d%s\n", host, port, path);
+    printf("connecting to %s:%d%s (%s)\n", host, port, path, is_wss ? "wss" : "ws");
 
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    char portstr[16];
-    snprintf(portstr, sizeof(portstr), "%d", port);
-    if (getaddrinfo(host, portstr, &hints, &res) != 0) {
-        fprintf(stderr, "error: cannot resolve %s\n", host);
-        return 1;
-    }
-    SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) {
-        fprintf(stderr, "error: socket() failed\n");
+    if (is_wss) {
+        if (wss_handshake(host, port, path) != 0) {
+            fprintf(stderr, "error: wss handshake failed\n");
+            return 1;
+        }
+    } else {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            fprintf(stderr, "error: WSAStartup failed\n");
+            return 1;
+        }
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        char portstr[16];
+        snprintf(portstr, sizeof(portstr), "%d", port);
+        if (getaddrinfo(host, portstr, &hints, &res) != 0) {
+            fprintf(stderr, "error: cannot resolve %s\n", host);
+            return 1;
+        }
+        SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (s == INVALID_SOCKET) {
+            fprintf(stderr, "error: socket() failed\n");
+            freeaddrinfo(res);
+            return 1;
+        }
+        if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
+            fprintf(stderr, "error: connect() failed (%d)\n", WSAGetLastError());
+            closesocket(s);
+            freeaddrinfo(res);
+            return 1;
+        }
         freeaddrinfo(res);
-        return 1;
-    }
-    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        fprintf(stderr, "error: connect() failed (%d)\n", WSAGetLastError());
-        closesocket(s);
-        freeaddrinfo(res);
-        return 1;
-    }
-    freeaddrinfo(res);
-    g_sock = s;
+        g_sock = s;
 
-    BYTE keyb[16];
-    rng_bytes(keyb, 16);
-    char keyb64[32];
-    base64(keyb, 16, keyb64);
-    char req[512];
-    snprintf(req, sizeof(req),
-             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
-             "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
-             "Sec-WebSocket-Version: 13\r\n\r\n",
-             path, host, port, keyb64);
-    if (!sock_send_all(s, req, (int)strlen(req))) {
-        fprintf(stderr, "error: handshake send failed\n");
-        return 1;
+        BYTE keyb[16];
+        rng_bytes(keyb, 16);
+        char keyb64[32];
+        base64(keyb, 16, keyb64);
+        char req[512];
+        snprintf(req, sizeof(req),
+                 "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+                 "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                 "Sec-WebSocket-Version: 13\r\n\r\n",
+                 path, host, port, keyb64);
+        if (!sock_send_all(s, req, (int)strlen(req))) {
+            fprintf(stderr, "error: handshake send failed\n");
+            return 1;
+        }
+        char resp[1024];
+        int rl = 0, r;
+        while (rl < (int)sizeof(resp) - 1) {
+            r = recv(s, resp + rl, 1, 0);
+            if (r <= 0) break;
+            rl += r;
+            if (rl >= 4 && resp[rl - 4] == '\r' && resp[rl - 3] == '\n' &&
+                resp[rl - 2] == '\r' && resp[rl - 1] == '\n')
+                break;
+        }
+        resp[rl] = 0;
+        if (strstr(resp, "101") == NULL) {
+            fprintf(stderr, "error: handshake failed:\n%s\n", resp);
+            return 1;
+        }
+        char *acc = strstr(resp, "sec-websocket-accept:");
+        if (acc) {
+            acc = strchr(acc, ':') + 1;
+            while (*acc == ' ') acc++;
+            char server_acc[128] = {0};
+            int i = 0;
+            while (*acc && *acc != '\r' && *acc != '\n' && i < 127) server_acc[i++] = *acc++;
+            char concat[64];
+            snprintf(concat, sizeof(concat), "%s%s", keyb64, WS_GUID);
+            BYTE hash[20];
+            sha1((BYTE *)concat, (DWORD)strlen(concat), hash);
+            char expect[64];
+            base64(hash, 20, expect);
+            if (_stricmp(server_acc, expect) != 0)
+                printf("warning: server accept mismatch (continuing)\n");
+        }
     }
-    char resp[1024];
-    int rl = 0, r;
-    while (rl < (int)sizeof(resp) - 1) {
-        r = recv(s, resp + rl, 1, 0);
-        if (r <= 0) break;
-        rl += r;
-        if (rl >= 4 && resp[rl - 4] == '\r' && resp[rl - 3] == '\n' &&
-            resp[rl - 2] == '\r' && resp[rl - 1] == '\n')
-            break;
-    }
-    resp[rl] = 0;
-    if (strstr(resp, "101") == NULL) {
-        fprintf(stderr, "error: handshake failed:\n%s\n", resp);
-        return 1;
-    }
-    char *acc = strstr(resp, "sec-websocket-accept:");
-    if (acc) {
-        acc = strchr(acc, ':') + 1;
-        while (*acc == ' ') acc++;
-        char server_acc[128] = {0};
-        int i = 0;
-        while (*acc && *acc != '\r' && *acc != '\n' && i < 127) server_acc[i++] = *acc++;
-        char concat[64];
-        snprintf(concat, sizeof(concat), "%s%s", keyb64, WS_GUID);
-        BYTE hash[20];
-        sha1((BYTE *)concat, (DWORD)strlen(concat), hash);
-        char expect[64];
-        base64(hash, 20, expect);
-        if (_stricmp(server_acc, expect) != 0)
-            printf("warning: server accept mismatch (continuing)\n");
-    }
+
     printf("websocket connected\n");
 
     BYTE priv[32];
@@ -513,7 +593,7 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
              "{\"type\":\"register\",\"name\":\"%s\",\"pubkey\":\"%s\",\"setupKey\":\"%s\"}",
              name && *name ? name : "forzer", pub_b64,
              setup_key && *setup_key ? setup_key : "changeme");
-    if (!ws_send_frame(s, 0x1, reg, (int)strlen(reg))) {
+    if (tr_send(reg, (int)strlen(reg)) <= 0) {
         fprintf(stderr, "error: register send failed\n");
         return 1;
     }
@@ -524,7 +604,7 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
 
     char buf[16384];
     for (;;) {
-        int n = ws_recv(s, buf, sizeof(buf));
+        int n = tr_recv(buf, sizeof(buf));
         if (n < 0) {
             printf("connection closed\n");
             break;
@@ -568,7 +648,7 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
             snprintf(res, sizeof(res),
                      "{\"type\":\"command-result\",\"to\":\"%s\",\"id\":\"%s\",\"data\":\"%s\",\"rc\":%d}",
                      from, id, esc, rc);
-            ws_send_frame(s, 0x1, res, (int)strlen(res));
+            tr_send(res, (int)strlen(res));
             printf("[command] done (rc=%d, %d bytes)\n", rc, (int)strlen(esc));
         } else if (strcmp(type, "command-result") == 0) {
             char id[64] = {0}, data[32768] = {0}, rc[16] = {0};
@@ -587,9 +667,19 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
         WaitForSingleObject(thr, 1000);
         CloseHandle(thr);
     }
-    closesocket(s);
-    g_sock = INVALID_SOCKET;
-    WSACleanup();
+    if (is_wss) {
+        if (g_ws) {
+            WinHttpWebSocketClose(g_ws, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+            WinHttpCloseHandle(g_ws);
+            g_ws = NULL;
+        }
+        if (g_ws_conn) { WinHttpCloseHandle(g_ws_conn); g_ws_conn = NULL; }
+        if (g_ws_sess) { WinHttpCloseHandle(g_ws_sess); g_ws_sess = NULL; }
+    } else {
+        closesocket(g_sock);
+        g_sock = INVALID_SOCKET;
+        WSACleanup();
+    }
     return 0;
 }
 
