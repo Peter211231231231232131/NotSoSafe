@@ -2,6 +2,8 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
@@ -14,6 +16,7 @@ const IP_PREFIX = [100, 64];
 // In-memory state. Render restarts wipe this; fine for an MVP.
 // A production build would use a database (Redis/Postgres).
 const devices = new Map(); // id -> { id, name, pubkey, ip, ws }
+const viewers = new Set(); // dashboard websockets (read-only map consumers)
 let networkVersion = 0;     // bumped whenever the peer set changes
 let ipCounter = 1;          // .1 reserved; first device gets 100.64.0.2
 
@@ -48,14 +51,29 @@ function broadcastMap() {
   for (const d of devices.values()) {
     if (d.ws && d.ws.readyState === 1) d.ws.send(payload);
   }
+  for (const v of viewers) {
+    if (v.readyState === 1) v.send(payload);
+  }
 }
 
-// --- HTTP surface (only health + info; the protocol itself is over WS) ---
+// --- HTTP surface (health, info, and the web dashboard) ---
+let dashboardHtml = '';
+try {
+  dashboardHtml = fs.readFileSync(path.join(__dirname, 'public', 'dashboard.html'), 'utf8');
+} catch (e) {
+  dashboardHtml = '<h1>Forzer dashboard not found</h1>';
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === 'GET' && url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, devices: devices.size, version: networkVersion }));
+    return;
+  }
+  if (url.pathname === '/dashboard' || url.pathname === '/dashboard/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(dashboardHtml);
     return;
   }
   if (url.pathname === '/' || url.pathname === '/index.html') {
@@ -64,6 +82,7 @@ const server = http.createServer((req, res) => {
       service: 'forzer-control-plane',
       transport: 'websocket',
       note: 'connect via ws:// (or wss:// behind TLS) and send {type:"register",...}',
+      dashboard: '/dashboard',
     }));
     return;
   }
@@ -102,6 +121,10 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'register') {
       handleRegister(ws, msg);
+    } else if (msg.type === 'dashboard') {
+      // Read-only viewer: receives map broadcasts, cannot relay/execute.
+      viewers.add(ws);
+      ws.send(JSON.stringify({ type: 'map', version: networkVersion, peers: peerList() }));
     } else if (ROUTABLE.has(msg.type)) {
       relay(ws, msg);
     }
@@ -112,6 +135,7 @@ wss.on('connection', (ws) => {
       devices.delete(ws.deviceId);
       broadcastMap();
     }
+    viewers.delete(ws);
   });
 
   ws.on('error', () => {});

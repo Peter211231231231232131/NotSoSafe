@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Forzer &middot; Control Plane Dashboard</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #121826;
+    --panel-2: #18212f;
+    --border: #243044;
+    --text: #e6edf6;
+    --muted: #8b9bb4;
+    --accent: #4f9dff;
+    --accent-2: #36d399;
+    --danger: #ff5d6c;
+    --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
+    background: radial-gradient(1200px 600px at 80% -10%, #15233b 0%, var(--bg) 55%);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(10, 14, 22, 0.6);
+    position: sticky;
+    top: 0;
+    backdrop-filter: blur(8px);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand .logo {
+    width: 34px; height: 34px; border-radius: 9px;
+    background: linear-gradient(135deg, var(--accent), #7c4dff);
+    display: grid; place-items: center; font-weight: 700; color: #fff;
+    box-shadow: 0 0 18px rgba(79, 157, 255, 0.4);
+  }
+  .brand h1 { font-size: 18px; margin: 0; letter-spacing: 0.3px; }
+  .brand small { color: var(--muted); font-weight: 400; }
+  .status {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--muted);
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 7px 12px; border-radius: 999px;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+  .dot.live { background: var(--accent-2); box-shadow: 0 0 10px var(--accent-2); }
+  .dot.connecting { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
+
+  main { padding: 24px 28px; max-width: 1200px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card {
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--border); border-radius: 14px; padding: 18px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .card .value { font-size: 30px; font-weight: 700; margin-top: 6px; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
+  }
+  .panel-head h2 { font-size: 15px; margin: 0; }
+  .panel-head .hint { color: var(--muted); font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  thead th {
+    text-align: left; color: var(--muted); font-weight: 600;
+    padding: 12px 18px; border-bottom: 1px solid var(--border);
+    text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px;
+  }
+  tbody td { padding: 13px 18px; border-bottom: 1px solid rgba(36, 48, 68, 0.5); }
+  tbody tr:hover { background: rgba(79, 157, 255, 0.05); }
+  tbody tr:last-child td { border-bottom: none; }
+  .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; background: rgba(54, 211, 153, 0.12); color: var(--accent-2); border: 1px solid rgba(54,211,153,0.3); }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+
+  .log { padding: 12px 18px; max-height: 240px; overflow: auto; font-size: 12.5px; }
+  .log .row { padding: 4px 0; border-bottom: 1px solid rgba(36,48,68,0.4); color: var(--muted); }
+  .log .row b { color: var(--text); font-weight: 600; }
+  .log .row .t { color: #5d6b82; margin-right: 8px; font-variant-numeric: tabular-nums; }
+
+  footer { color: var(--muted); font-size: 12px; text-align: center; padding: 24px; }
+  code.k { color: var(--accent); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="logo">F</div>
+      <div>
+        <h1>Forzer Control Plane</h1>
+        <small>WebSocket mesh coordinator &middot; live dashboard</small>
+      </div>
+    </div>
+    <div class="status">
+      <span id="dot" class="dot"></span>
+      <span id="conn">disconnected</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="cards">
+      <div class="card">
+        <div class="label">Connected peers</div>
+        <div class="value" id="stat-peers">0</div>
+        <div class="sub" id="stat-peers-sub">devices online</div>
+      </div>
+      <div class="card">
+        <div class="label">Network version</div>
+        <div class="value" id="stat-version">0</div>
+        <div class="sub">mesh revision</div>
+      </div>
+      <div class="card">
+        <div class="label">Last update</div>
+        <div class="value" id="stat-updated" style="font-size:20px;line-height:40px;">&mdash;</div>
+        <div class="sub" id="stat-clock">as of &mdash;</div>
+      </div>
+      <div class="card">
+        <div class="label">Transport</div>
+        <div class="value" id="stat-transport" style="font-size:20px;line-height:40px;">wss/ws</div>
+        <div class="sub">upgrade-aware</div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-bottom:22px;">
+      <div class="panel-head">
+        <h2>Peers</h2>
+        <span class="hint">auto-refreshes over WebSocket</span>
+      </div>
+      <div id="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>ID</th>
+              <th>Assigned IP</th>
+              <th>Public key</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="peers-body"></tbody>
+        </table>
+        <div id="empty" class="empty">No peers connected yet.</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Event log</h2>
+        <span class="hint" id="log-count">0 events</span>
+      </div>
+      <div class="log" id="log"></div>
+    </section>
+  </main>
+
+  <footer>
+    Forzer control plane &middot; register implants with <code class="k">FORZER_SERVER</code> pointing here &middot; dashboard is read-only
+  </footer>
+
+<script>
+  var dot = document.getElementById('dot');
+  var conn = document.getElementById('conn');
+  var body = document.getElementById('peers-body');
+  var empty = document.getElementById('empty');
+  var logEl = document.getElementById('log');
+  var logCount = 0;
+
+  function setConn(state, text) {
+    dot.className = 'dot ' + (state === 'live' ? 'live' : state === 'connecting' ? 'connecting' : '');
+    conn.textContent = text;
+  }
+
+  function log(msg) {
+    var row = document.createElement('div');
+    row.className = 'row';
+    var d = new Date();
+    var ts = d.toTimeString().slice(0, 8);
+    row.innerHTML = '<span class="t">' + ts + '</span>' + msg;
+    logEl.insertBefore(row, logEl.firstChild);
+    logCount++;
+    if (logCount > 200) { logEl.removeChild(logEl.lastChild); logCount--; }
+    document.getElementById('log-count').textContent = logCount + ' events';
+  }
+
+  function shortId(id) { return id ? id.slice(0, 8) + '…' : '—'; }
+  function shortKey(k) { return k ? k.slice(0, 12) + '…' + k.slice(-6) : '—'; }
+
+  function render(data) {
+    var peers = (data && data.peers) || [];
+    document.getElementById('stat-peers').textContent = peers.length;
+    document.getElementById('stat-version').textContent = data ? data.version : 0;
+    var now = new Date();
+    document.getElementById('stat-updated').textContent =
+      now.toTimeString().slice(0, 8);
+    document.getElementById('stat-clock').textContent = 'as of ' + now.toDateString();
+
+    body.innerHTML = '';
+    if (peers.length === 0) {
+      empty.style.display = 'block';
+    } else {
+      empty.style.display = 'none';
+      peers.forEach(function (p) {
+        var tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td>' + escapeHtml(p.name || 'unnamed') + '</td>' +
+          '<td class="mono">' + shortId(p.id) + '</td>' +
+          '<td class="mono">' + (p.ip || '—') + '</td>' +
+          '<td class="mono" title="' + escapeHtml(p.pubkey || '') + '">' + shortKey(p.pubkey) + '</td>' +
+          '<td><span class="pill"><span class="dot live" style="width:7px;height:7px;"></span>online</span></td>';
+        body.appendChild(tr);
+      });
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  var ws = null;
+  var reconnectTimer = null;
+
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    var url = proto + '://' + location.host + '/';
+    setConn('connecting', 'connecting…');
+    log('connecting to <b>' + escapeHtml(url) + '</b>');
+    ws = new WebSocket(url);
+
+    ws.onopen = function () {
+      setConn('live', 'live');
+      ws.send(JSON.stringify({ type: 'dashboard' }));
+      log('<b>connected</b> &middot; subscribed as dashboard viewer');
+    };
+
+    ws.onmessage = function (ev) {
+      try {
+        var msg = JSON.parse(ev.data);
+        if (msg.type === 'map') {
+          render(msg);
+          log('mesh update &middot; <b>' + (msg.peers ? msg.peers.length : 0) +
+              '</b> peer(s) &middot; v' + msg.version);
+        }
+      } catch (e) { /* ignore */ }
+    };
+
+    ws.onclose = function () {
+      setConn('down', 'disconnected');
+      log('connection closed &middot; retrying in 3s');
+      if (!reconnectTimer) {
+        reconnectTimer = setTimeout(function () { reconnectTimer = null; connect(); }, 3000);
+      }
+    };
+
+    ws.onerror = function () {
+      setConn('down', 'error');
+      try { ws.close(); } catch (e) {}
+    };
+  }
+
+  connect();
+</script>
+</body>
+</html>
