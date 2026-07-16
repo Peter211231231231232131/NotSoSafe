@@ -186,7 +186,7 @@ function deliver(ws, payload) {
 }
 
 function relay(ws, msg) {
-  // A registered device relays with its own device id as the source.
+    // A registered device relays with its own device id as the source.
   if (ws.deviceId) {
     const target = devices.get(String(msg.to || ''));
     // Forward to a peer when the destination is another device.

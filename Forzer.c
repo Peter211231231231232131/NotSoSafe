@@ -1015,6 +1015,8 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
         buf[n] = 0;
         char type[32] = {0};
         json_str(buf, "type", type, sizeof(type));
+        char from[64] = {0};
+        json_str(buf, "from", from, sizeof(from));
         if (strcmp(type, "registered") == 0) {
             char id[64] = {0}, ip[64] = {0}, err[128] = {0};
             json_str(buf, "id", id, sizeof(id));
